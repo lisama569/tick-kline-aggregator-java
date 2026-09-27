@@ -36,7 +36,8 @@ public class MarketDataController {
         return klineService.report(tick);
     }
 
-    /** 查询某时刻所属窗口的 K 线一致快照；窗口无数据返回 404。
+    /** 查询某时刻所属窗口的 K 线一致快照；保留范围内无数据返回 404；
+     *  窗口已回收、或大周期窗口无法由保留的小周期窗口完整覆盖时，返回 400 + WINDOW_EVICTED。
      *  可选 periodMs 指定聚合周期（须为已配置周期），缺省为默认周期。 */
     @GetMapping("/klines/{symbol}/at/{timestamp}")
     public ResponseEntity<Kline> klineAt(@PathVariable String symbol,
@@ -49,7 +50,8 @@ public class MarketDataController {
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
-    /** 查询某标的全部保留 K 线（按窗口起点升序）。可选 periodMs 指定周期，缺省为默认周期。 */
+    /** 查询某标的全部保留 K 线（按窗口起点升序）。可选 periodMs 指定周期，缺省为默认周期。
+     *  无法由保留的小周期窗口完整覆盖的大周期窗口不出现在结果中。 */
     @GetMapping("/klines/{symbol}")
     public List<Kline> klines(@PathVariable String symbol,
                               @RequestParam(required = false) Long periodMs) {

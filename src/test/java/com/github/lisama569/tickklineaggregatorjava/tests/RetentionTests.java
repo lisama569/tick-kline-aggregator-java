@@ -69,8 +69,13 @@ class RetentionTests {
         assertEquals(102.0, retained.get(0).open(), "保留窗口的聚合结果不得受回收影响");
         assertEquals(1, retained.get(0).tradeCount());
 
-        assertTrue(aggregator.klineAt(SYMBOL, base).isEmpty(), "已回收窗口单点查询返回空");
-        assertTrue(aggregator.klineAt(SYMBOL, base + M1).isEmpty());
+        // 新语义：已回收窗口的单点查询不再静默返回空，而是以 WINDOW_EVICTED 明确告知不可用
+        TickRejectedException ev0 = assertThrows(TickRejectedException.class,
+                () -> aggregator.klineAt(SYMBOL, base));
+        assertEquals(RejectReason.WINDOW_EVICTED, ev0.getReason(), "已回收窗口单点查询必须明确告知不可用");
+        TickRejectedException ev1 = assertThrows(TickRejectedException.class,
+                () -> aggregator.klineAt(SYMBOL, base + M1));
+        assertEquals(RejectReason.WINDOW_EVICTED, ev1.getReason());
         assertTrue(aggregator.klineAt(SYMBOL, base + 2 * M1).isPresent(), "保留窗口仍可查");
     }
 
@@ -93,8 +98,11 @@ class RetentionTests {
         TickRejectedException ex2 = assertThrows(TickRejectedException.class, () -> aggregator.ingest(late));
         assertEquals(RejectReason.WINDOW_EVICTED, ex2.getReason(), "同一迟到成交重复提交结论必须一致");
 
-        // 不生成残缺窗口、不影响保留结果
-        assertTrue(aggregator.klineAt(SYMBOL, base).isEmpty(), "被拒绝的迟到成交不得生成残缺窗口");
+        // 不生成残缺窗口、不影响保留结果（新语义：已回收窗口单点查询抛 WINDOW_EVICTED）
+        TickRejectedException ev = assertThrows(TickRejectedException.class,
+                () -> aggregator.klineAt(SYMBOL, base));
+        assertEquals(RejectReason.WINDOW_EVICTED, ev.getReason(),
+                "被拒绝的迟到成交不得生成残缺窗口，已回收窗口查询必须明确不可用");
         assertEquals(before, aggregator.klines(SYMBOL), "保留窗口结果不得被迟到成交改变");
     }
 
@@ -113,15 +121,21 @@ class RetentionTests {
         assertEquals(1, aggregator.klineAt(SYMBOL, base + 4 * M1).orElseThrow().tradeCount(),
                 "重复提交不得重复计入");
 
-        // 已回收窗口中的重复提交：窗口已不存在，按 WINDOW_EVICTED 拒绝，同样不会重复计入
+        // 已回收窗口中的重复提交：幂等判定先于回收检查，仍稳定判 DUPLICATE；
+        // 不得复生已回收窗口、不得改变保留范围（本次修正后的新语义，原为 WINDOW_EVICTED）
         TradeTick dupEvicted = tick("E0", 100.0, 1.0, base + 100);
+        List<Kline> before = aggregator.klines(SYMBOL);
         System.out.println("[回收幂等] 输入2: 重复提交已回收窗口 w0 中曾接受的 tickId=E0");
-        System.out.println("[回收幂等] 判定依据: 回收检查先于一切状态变更, 结论为 WINDOW_EVICTED 且不会重复计入");
-        TickRejectedException ex = assertThrows(TickRejectedException.class,
-                () -> aggregator.ingest(dupEvicted));
-        System.out.println("[回收幂等] 实际2: reason=" + ex.getReason());
-        assertEquals(RejectReason.WINDOW_EVICTED, ex.getReason());
-        assertTrue(aggregator.klineAt(SYMBOL, base).isEmpty(), "已回收窗口不得因重复提交而复生");
+        System.out.println("[回收幂等] 判定依据: 幂等判定先于回收检查, 已接受过的成交无论窗口是否回收都判 DUPLICATE,"
+                + " 且不触碰窗口状态(不复生、不改变保留范围)");
+        IngestResult r2 = aggregator.ingest(dupEvicted);
+        System.out.println("[回收幂等] 实际2: " + r2);
+        assertEquals(IngestStatus.DUPLICATE, r2.status(),
+                "回收不得改变已成立的幂等判定：已接受过的成交再报必须仍判 DUPLICATE");
+        TickRejectedException ev = assertThrows(TickRejectedException.class,
+                () -> aggregator.klineAt(SYMBOL, base));
+        assertEquals(RejectReason.WINDOW_EVICTED, ev.getReason(), "已回收窗口不得因重复提交而复生");
+        assertEquals(before, aggregator.klines(SYMBOL), "重复提交不得改变保留范围与保留窗口结果");
     }
 
     @Test
@@ -145,36 +159,42 @@ class RetentionTests {
 
     @Test
     void evictionRejectionIsAtomicAcrossPeriods() {
-        // 多周期：1m 上限 2 窗（约 2 分钟），5m 上限 2 窗（约 10 分钟）。
-        // 一笔迟到 3 分钟的成交：1m 窗口已回收，但 5m 窗口仍保留 —— 必须整体拒绝，
-        // 不允许只写进 5m 而造成周期间对不上的部分写入。
+        // 多周期：1m/5m，上限各 2 窗。写入横跨两个 5m 窗口的 6 个 1m 窗口后：
+        // 1m 侧只保留 w4,w5；5m 窗口 F0(覆盖 w0..w4) 因小周期数据不齐变为不可用，
+        // 5m 窗口 F1(覆盖 w5..w9) 仍由保留的 1m 窗口完整覆盖而可用。
+        // 一笔落入已回收 1m 窗口的迟到成交必须整体拒绝，任何周期都不得写入。
         KlineProperties props = new KlineProperties();
         props.setWindowSizeMs(M1);
         props.setAdditionalWindowSizesMs(List.of(M5));
         props.setMaxWindowsPerSymbol(2);
         KlineAggregator multi = new KlineAggregator(props);
 
-        // 基准对齐到 5m 边界，保证四笔成交落在同一个 5m 窗口内
+        // 基准对齐到 5m 边界；w0..w4 属于 F0，w5 属于 F1
         long t0 = Math.floorDiv(System.currentTimeMillis(), M5) * M5;
-        // 写入 w0..w3 四个 1m 窗口（同一 5m 窗口内），1m 侧回收 w0,w1
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 6; i++) {
             multi.ingest(new TradeTick("M" + i, SYMBOL, 100.0 + i, 1.0, t0 + i * M1 + 100));
         }
-        Optional<Kline> k5Before = multi.klineAt(SYMBOL, M5, t0);
-        System.out.println("[多周期回收] 前置: 1m 已回收 w0,w1; 5m 窗口仍保留=" + k5Before.orElse(null));
-        assertTrue(k5Before.isPresent());
-        assertEquals(4, k5Before.get().tradeCount());
+        System.out.println("[多周期回收] 前置: 写入 6 个 1m 窗口(上限2), 1m 仅保留 w4,w5; "
+                + "5m 窗口 F0 因 1m 覆盖不齐不可用, F1 可用=" + multi.klines(SYMBOL, M5));
+
+        // 新语义：F0 已不可用，单点查询必须显式拒绝而不是返回对不上的数据
+        TickRejectedException k5ev = assertThrows(TickRejectedException.class,
+                () -> multi.klineAt(SYMBOL, M5, t0));
+        assertEquals(RejectReason.WINDOW_EVICTED, k5ev.getReason(),
+                "小周期数据凑不齐的 5m 窗口必须明确告知不可用");
+        Kline k5F1Before = multi.klineAt(SYMBOL, M5, t0 + 5 * M1).orElseThrow();
+        assertEquals(1, k5F1Before.tradeCount(), "F1 仍由保留的 1m 窗口完整覆盖，必须保留");
 
         TradeTick late = new TradeTick("LATE-X", SYMBOL, 555.0, 9.0, t0 + 50); // 落入已回收的 1m w0
-        System.out.println("[多周期回收] 输入: 迟到成交落入已回收的 1m w0, 但其 5m 窗口仍保留");
-        System.out.println("[多周期回收] 判定依据: 任一周期已回收即整体 WINDOW_EVICTED 拒绝, 5m 侧不得出现部分写入");
+        System.out.println("[多周期回收] 输入: 迟到成交落入已回收的 1m w0 (其 5m 窗口 F0 也已回收)");
+        System.out.println("[多周期回收] 判定依据: 任一周期已回收即整体 WINDOW_EVICTED 拒绝, 任何周期不得出现部分写入");
         TickRejectedException ex = assertThrows(TickRejectedException.class, () -> multi.ingest(late));
         System.out.println("[多周期回收] 实际: reason=" + ex.getReason());
         assertEquals(RejectReason.WINDOW_EVICTED, ex.getReason());
 
-        Kline k5After = multi.klineAt(SYMBOL, M5, t0).orElseThrow();
-        System.out.println("[多周期回收] 拒绝后 5m 窗口: " + k5After);
-        assertEquals(k5Before.get(), k5After, "5m 窗口不得计入被整体拒绝的迟到成交");
-        assertEquals(4, k5After.tradeCount());
+        Kline k5F1After = multi.klineAt(SYMBOL, M5, t0 + 5 * M1).orElseThrow();
+        System.out.println("[多周期回收] 拒绝后保留的 5m 窗口 F1: " + k5F1After);
+        assertEquals(k5F1Before, k5F1After, "保留的 5m 窗口不得计入被整体拒绝的迟到成交");
+        assertEquals(1, multi.klines(SYMBOL, M5).size(), "可用窗口集合不得因迟到成交而改变");
     }
 }
