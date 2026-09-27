@@ -109,4 +109,105 @@ class MarketDataControllerTests {
         mockMvc.perform(get("/api/market/klines/NOSUCH/at/{ts}", System.currentTimeMillis()))
                 .andExpect(status().isNotFound());
     }
+
+    @Test
+    void sameTicksAggregateIndependentlyAcrossConfiguredPeriods() throws Exception {
+        long now = System.currentTimeMillis();
+        long minute = 60_000L;
+        long bigBase = (now / (5 * minute)) * (5 * minute);
+        long ts0 = bigBase;                 // Bx 的第 1 个小窗
+        long ts1 = bigBase + minute + 100;  // 第 2 个小窗
+        mockMvc.perform(post("/api/market/ticks").contentType(MediaType.APPLICATION_JSON)
+                        .content(tickJson("mp-1", "MPUSDT", "100", "2", ts0)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ACCEPTED"))
+                .andExpect(jsonPath("$.windowStarts.60000").value(bigBase))
+                .andExpect(jsonPath("$.windowStarts.300000").value(bigBase));
+        mockMvc.perform(post("/api/market/ticks").contentType(MediaType.APPLICATION_JSON)
+                        .content(tickJson("mp-2", "MPUSDT", "110", "3", ts1)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.windowStarts.60000").value(bigBase + minute))
+                .andExpect(jsonPath("$.windowStarts.300000").value(bigBase));
+
+        System.out.println("[接口多周期] 输入: 2 笔成交落在 60000ms 两窗、300000ms 同一窗");
+        System.out.println("[接口多周期] 判定依据: 每笔每周期只计一次, 大周期笔数=2/量=5");
+
+        mockMvc.perform(get("/api/market/klines/MPUSDT/at/{ts}", ts1).param("windowSizeMs", "60000"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.tradeCount").value(1));
+        mockMvc.perform(get("/api/market/klines/MPUSDT/at/{ts}", ts1).param("windowSizeMs", "300000"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.tradeCount").value(2))
+                .andExpect(jsonPath("$.volume").value(5.0))
+                .andExpect(jsonPath("$.open").value(100.0))
+                .andExpect(jsonPath("$.close").value(110.0));
+
+        // 不带 windowSizeMs 仍使用主周期 60000（兼容性）
+        mockMvc.perform(get("/api/market/klines/MPUSDT/at/{ts}", ts1))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.tradeCount").value(1));
+
+        // 未配置周期 -> 400 + UNKNOWN_PERIOD
+        mockMvc.perform(get("/api/market/klines/MPUSDT/at/{ts}", ts1).param("windowSizeMs", "12345"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.reason").value("UNKNOWN_PERIOD"));
+    }
+
+    @Test
+    void rangeQueryReturnsConsistentBatchWithDistinguishableWindowStates() throws Exception {
+        long minute = 60_000L;
+        long base = (System.currentTimeMillis() / minute) * minute;
+        mockMvc.perform(post("/api/market/ticks").contentType(MediaType.APPLICATION_JSON)
+                .content(tickJson("rg-1", "RGUSDT", "100", "1", base))).andExpect(status().isOk());
+        mockMvc.perform(post("/api/market/ticks").contentType(MediaType.APPLICATION_JSON)
+                .content(tickJson("rg-2", "RGUSDT", "120", "2", base + 2 * minute))).andExpect(status().isOk());
+
+        System.out.println("[接口范围] 输入: 成交@w0/@w2, 范围覆盖 w0..w2");
+        System.out.println("[接口范围] 判定依据: 状态序列 HAS_DATA,EMPTY,HAS_DATA; 空窗可与 NOT_RETAINED 区分");
+
+        mockMvc.perform(get("/api/market/klines/RGUSDT/range")
+                        .param("from", String.valueOf(base))
+                        .param("to", String.valueOf(base + 2 * minute)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.windowSizeMs").value(60000))
+                .andExpect(jsonPath("$.oldestWindowStart").value(base))
+                .andExpect(jsonPath("$.newestWindowStart").value(base + 2 * minute))
+                .andExpect(jsonPath("$.windows.length()").value(3))
+                .andExpect(jsonPath("$.windows[0].state").value("HAS_DATA"))
+                .andExpect(jsonPath("$.windows[0].kline.open").value(100.0))
+                .andExpect(jsonPath("$.windows[1].state").value("EMPTY"))
+                .andExpect(jsonPath("$.windows[1].kline").doesNotExist())
+                .andExpect(jsonPath("$.windows[2].state").value("HAS_DATA"))
+                .andExpect(jsonPath("$.windows[2].kline.volume").value(2.0));
+
+        // 更早的范围：NOT_RETAINED，且保留边界字段如实回报
+        mockMvc.perform(get("/api/market/klines/RGUSDT/range")
+                        .param("windowSizeMs", "60000")
+                        .param("from", String.valueOf(base - 2 * minute))
+                        .param("to", String.valueOf(base - minute)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.windows[0].state").value("NOT_RETAINED"))
+                .andExpect(jsonPath("$.windows[1].state").value("NOT_RETAINED"))
+                .andExpect(jsonPath("$.oldestWindowStart").value(base));
+    }
+
+    @Test
+    void rangeQueryValidatesParamsWithDistinctReasons() throws Exception {
+        long ts = System.currentTimeMillis();
+        System.out.println("[接口范围] 输入: from>to / 非数字 to / 缺 from");
+        System.out.println("[接口范围] 判定依据: INVALID_RANGE / INVALID_RANGE / INVALID_RANGE");
+
+        mockMvc.perform(get("/api/market/klines/RGUSDT/range")
+                        .param("from", String.valueOf(ts + 10)).param("to", String.valueOf(ts)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.reason").value("INVALID_RANGE"));
+        mockMvc.perform(get("/api/market/klines/RGUSDT/range")
+                        .param("from", String.valueOf(ts)).param("to", "not-a-number"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.reason").value("INVALID_RANGE"));
+        mockMvc.perform(get("/api/market/klines/RGUSDT/range")
+                        .param("to", String.valueOf(ts)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.reason").value("INVALID_RANGE"));
+    }
 }

@@ -4,8 +4,10 @@ import com.github.lisama569.tickklineaggregatorjava.model.RejectReason;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
  * 统一错误处理：将拒绝原因以可区分的方式返回给调用方，绝不静默丢弃。
@@ -32,5 +34,28 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new RejectionResponse(RejectReason.MALFORMED_REQUEST,
                         "request body cannot be parsed: " + ex.getMessage()));
+    }
+
+    /** 路径/查询参数类型不匹配（数字位置传了非数字字符串）。 */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<RejectionResponse> handleTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        String name = ex.getName();
+        RejectReason reason = switch (name) {
+            case "from", "to" -> RejectReason.INVALID_RANGE;
+            case "timestamp" -> RejectReason.INVALID_TIMESTAMP;
+            default -> RejectReason.MALFORMED_REQUEST;
+        };
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new RejectionResponse(reason,
+                        "parameter '" + name + "' must be a number (epoch millis), got: " + ex.getValue()));
+    }
+
+    /** 缺少必填查询参数（如范围查询未提供 from/to）。 */
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    public ResponseEntity<RejectionResponse> handleMissingParam(MissingServletRequestParameterException ex) {
+        RejectReason reason = "from".equals(ex.getParameterName()) || "to".equals(ex.getParameterName())
+                ? RejectReason.INVALID_RANGE : RejectReason.MALFORMED_REQUEST;
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new RejectionResponse(reason, "missing required parameter: " + ex.getParameterName()));
     }
 }
