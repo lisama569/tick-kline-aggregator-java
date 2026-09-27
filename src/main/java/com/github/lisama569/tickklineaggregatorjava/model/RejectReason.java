@@ -16,5 +16,12 @@ public enum RejectReason {
     UNSUPPORTED_WINDOW_SIZE,
     /** 范围查询参数非法（如起止颠倒、跨度超上限） */
     INVALID_RANGE,
+    /**
+     * 大周期窗口自身虽仍有数据，但它覆盖的最小周期窗口已被回收，
+     * 无法由仍然保留的小周期数据完整核对，该大周期结果不可信、不可用
+     */
+    WINDOW_UNVERIFIABLE,
+    /** 周期组合非法（如存在不是基础周期整数倍的周期，窗口边界无法对齐），服务拒绝启动 */
+    INVALID_PERIOD_CONFIG,
     MALFORMED_REQUEST
 }

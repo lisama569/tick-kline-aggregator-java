@@ -24,8 +24,9 @@ public class KlineService {
     }
 
     /**
-     * 上报一笔成交。非法输入抛 TickRejectedException；重复提交返回 DUPLICATE；
-     * 目标窗口已回收时抛 WINDOW_EVICTED。
+     * 上报一笔成交。非法输入抛 TickRejectedException；
+     * 只要该 tickId 曾被接受过，重复提交（即使其窗口已回收）一律返回 DUPLICATE；
+     * 从未接受过的成交落入任一已回收窗口时抛 WINDOW_EVICTED。
      */
     public IngestResult report(TradeTick tick) {
         validator.validate(tick);

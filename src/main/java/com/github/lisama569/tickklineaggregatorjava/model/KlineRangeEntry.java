@@ -21,4 +21,12 @@ public record KlineRangeEntry(long windowStart, long windowEnd, WindowStatus sta
     public static KlineRangeEntry unavailable(long windowStart, long windowEnd) {
         return new KlineRangeEntry(windowStart, windowEnd, WindowStatus.UNAVAILABLE, null);
     }
+
+    /**
+     * 大周期窗口自身仍有聚合值，但覆盖的小周期窗口已被回收、无法完整核对：
+     * 不携带 K 线，按不可用处理，避免调用方把不可信大周期当成正常结果。
+     */
+    public static KlineRangeEntry unverifiable(long windowStart, long windowEnd) {
+        return new KlineRangeEntry(windowStart, windowEnd, WindowStatus.UNVERIFIABLE, null);
+    }
 }

@@ -11,6 +11,7 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -27,20 +28,30 @@ import java.util.concurrent.ConcurrentHashMap;
  *       windowStart = floorDiv(timestamp, windowSizeMs) * windowSizeMs，
  *       恰好落在窗口起点的成交只归属该窗口。</li>
  *   <li>多周期：每个标的为每个已配置周期各维护一份独立窗口表；同一笔成交在每个周期
- *       各计一次且只计一次。由于各周期由同一成交流按相同的确定性规则独立聚合，
- *       大周期窗口的 open/high/low/close/volume/tradeCount 与其覆盖的全部小周期窗口
- *       合起来必然严格一致。</li>
+ *       各计一次且只计一次。配置的每个周期必须是最小（基础）周期的<b>整数倍</b>，
+ *       否则大周期窗口边界永远无法与小周期对齐，构造时即以
+ *       {@code INVALID_PERIOD_CONFIG} 拒绝启动。由于各周期由同一成交流按相同的确定性
+ *       规则独立聚合，大周期窗口的 open/high/low/close/volume/tradeCount 与其覆盖的
+ *       全部小周期窗口合起来必然严格一致。</li>
  *   <li>幂等：同一 symbol 下相同 tickId 只计入一次，重复提交返回 DUPLICATE。
- *       去重表不随窗口回收而删除，回收不影响既有幂等判定。</li>
+ *       去重表不随窗口回收而删除，<b>幂等判定先于回收判定</b>：一笔成交只要曾经被
+ *       接受过，无论其窗口后来是否被回收，再次上报永远是 DUPLICATE，不会重复计入，
+ *       也不会变成 WINDOW_EVICTED。</li>
  *   <li>乱序/迟到：open 取窗口内时间戳最小成交的价格，close 取时间戳最大成交的价格；
  *       时间戳相同按 tickId 字典序打破平局，结果与到达顺序无关、唯一确定。</li>
- *   <li>一致性：同一「标的+周期」的所有读写在同一把 store 锁内完成，单窗口更新与
- *       范围查询均为原子操作；范围查询返回的一批窗口来自同一时刻的一致视图，
- *       不会出现部分窗口已计入新成交、部分仍是旧值。</li>
+ *   <li>一致性：同一标的的所有读写在同一把 SymbolEntry 锁内完成。单笔成交的
+ *       「幂等判定 → 全周期回收检查 → 全周期写入与回收」是一个原子操作，并发上报
+ *       结论与串行完全一致，不会出现部分周期写入；范围查询返回的一批窗口来自同一
+ *       时刻的一致视图。</li>
  *   <li>保留回收：每个标的、每个周期最多保留 maxWindowsPerSymbol 个窗口，超出后
- *       按窗口起点升序回收最旧窗口，并推进回收水位线。迟到成交若落入已回收窗口，
+ *       按窗口起点升序回收最旧窗口，并推进回收水位线。迟到成交若落入任一已回收窗口，
  *       在任何状态变更之前即以 WINDOW_EVICTED 显式拒绝，不生成残缺窗口、不重复计入。
  *       回收只由已接受的不同成交驱动，与墙钟无关，结论可复现。</li>
+ *   <li>跨周期可信性：回收只保证每个周期自身窗口数有界，而相同上限下最小周期水位线
+ *       推进最快。大周期窗口只有在其起点不早于最小周期回收水位线时，才能由仍然保留
+ *       的全部小周期窗口完整对上；否则即使大周期自身仍有聚合值，也按“不可用”处理：
+ *       单点查询以 WINDOW_UNVERIFIABLE 拒绝，范围查询标注 UNVERIFIABLE，列表查询
+ *       直接剔除，绝不把对不上的大周期当成正常结果返回。</li>
  * </ul>
  */
 @Component
@@ -57,7 +68,7 @@ public class KlineAggregator {
     }
 
     /**
-     * 单个窗口的可变聚合状态。仅在所属 WindowStore 的锁内被读写，无需自带同步。
+     * 单个窗口的可变聚合状态。仅在所属 SymbolEntry 的锁内被读写，无需自带同步。
      */
     private static final class KlineState {
         private double high = Double.NEGATIVE_INFINITY;
@@ -102,8 +113,7 @@ public class KlineAggregator {
     }
 
     /**
-     * 单一标的、单一周期的窗口表。所有公开方法均在实例锁内执行：
-     * 单窗口更新原子，范围查询拿到的是同一时刻的一致视图。
+     * 单一标的、单一周期的窗口表。所有方法都在所属 {@link SymbolEntry} 的锁内被调用。
      */
     private final class WindowStore {
         private final long windowSizeMs;
@@ -117,8 +127,17 @@ public class KlineAggregator {
             this.maxWindows = maxWindows;
         }
 
+        private long windowSizeMs() {
+            return windowSizeMs;
+        }
+
+        /** 回收水位线：窗口起点小于该值即已回收。 */
+        private long evictedBefore() {
+            return evictedBefore;
+        }
+
         /** 窗口是否已被回收；是则抛出可区分的拒绝异常，不改动任何状态。 */
-        synchronized void checkNotEvicted(long windowStart) {
+        private void checkNotEvicted(long windowStart) {
             if (windowStart < evictedBefore) {
                 throw new TickRejectedException(RejectReason.WINDOW_EVICTED,
                         "window starting at " + windowStart + " (size=" + windowSizeMs
@@ -127,7 +146,7 @@ public class KlineAggregator {
         }
 
         /** 计入一笔成交，随后按上限回收最旧窗口（回收顺序确定、与墙钟无关）。 */
-        synchronized void apply(TradeTick tick) {
+        private void apply(TradeTick tick) {
             long windowStart = windowStartOf(tick.timestamp(), windowSizeMs);
             windows.computeIfAbsent(windowStart, k -> new KlineState()).apply(tick);
             while (windows.size() > maxWindows) {
@@ -136,59 +155,48 @@ public class KlineAggregator {
             }
         }
 
-        synchronized Optional<Kline> klineAt(String symbol, long timestamp) {
-            long windowStart = windowStartOf(timestamp, windowSizeMs);
-            if (windowStart < evictedBefore) {
-                return Optional.empty();
-            }
-            KlineState state = windows.get(windowStart);
-            return state == null
-                    ? Optional.empty()
-                    : Optional.of(state.snapshot(symbol, windowStart, windowSizeMs));
+        private KlineState stateAt(long windowStart) {
+            return windows.get(windowStart);
         }
 
-        synchronized List<Kline> all(String symbol) {
+        private List<Kline> all(String symbol, long notBefore) {
             List<Kline> result = new ArrayList<>(windows.size());
             for (Map.Entry<Long, KlineState> e : windows.entrySet()) {
-                result.add(e.getValue().snapshot(symbol, e.getKey(), windowSizeMs));
+                // 起点早于最小周期回收水位线的大周期窗口无法由保留小周期对上，不返回
+                if (e.getKey() >= notBefore) {
+                    result.add(e.getValue().snapshot(symbol, e.getKey(), windowSizeMs));
+                }
             }
             return result; // TreeMap 已按窗口起点升序
         }
+    }
 
-        /**
-         * 一致视图下的范围查询：返回窗口起点落在 [from, to) 的全部网格槽位，
-         * 逐槽位标注 FILLED / EMPTY / UNAVAILABLE。整批在同一把锁内生成。
-         */
-        synchronized List<KlineRangeEntry> range(String symbol, long from, long to) {
-            long firstIndex = ceilDiv(from, windowSizeMs);
-            long endIndex = ceilDiv(to, windowSizeMs);
-            List<KlineRangeEntry> entries = new ArrayList<>((int) Math.max(0, endIndex - firstIndex));
-            for (long i = firstIndex; i < endIndex; i++) {
-                long start = Math.multiplyExact(i, windowSizeMs);
-                long end = Math.addExact(start, windowSizeMs);
-                KlineState state = windows.get(start);
-                if (state != null) {
-                    entries.add(KlineRangeEntry.filled(state.snapshot(symbol, start, windowSizeMs)));
-                } else if (start < evictedBefore) {
-                    entries.add(KlineRangeEntry.unavailable(start, end));
-                } else {
-                    entries.add(KlineRangeEntry.empty(start, end));
-                }
+    /**
+     * 单一标的的全部状态：各周期窗口表 + 幂等去重表。实例本身即锁对象：
+     * 该标的的 ingest 与所有查询都在 synchronized(entry) 内完成，结论与串行一致。
+     */
+    private final class SymbolEntry {
+        private final ConcurrentHashMap<Long, WindowStore> stores;
+        private final Set<String> seenTickIds = new HashSet<>();
+
+        private SymbolEntry() {
+            ConcurrentHashMap<Long, WindowStore> created = new ConcurrentHashMap<>();
+            for (long size : periodSizes) {
+                created.put(size, new WindowStore(size, properties.getMaxWindowsPerSymbol()));
             }
-            return entries;
+            this.stores = created;
         }
     }
 
     private final KlineProperties properties;
-    /** 已配置的全部周期（毫秒），升序、去重；首个为默认周期 */
+    /** 已配置的全部周期（毫秒），升序、去重；首个即最小（基础）周期 */
     private final long[] periodSizes;
+    /** 最小（基础）周期：回收水位线对它最紧，也是跨周期对齐/可信性判定的基准 */
+    private final long baseWindowSizeMs;
     private final long defaultWindowSizeMs;
 
-    /** symbol -> (periodMs -> WindowStore) */
-    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, WindowStore>> storesBySymbol =
-            new ConcurrentHashMap<>();
-    /** 幂等去重表：symbol -> 已处理的 tickId 集合（不随窗口回收删除） */
-    private final ConcurrentHashMap<String, Set<String>> seenTickIds = new ConcurrentHashMap<>();
+    /** symbol -> 该标的的全部状态 */
+    private final ConcurrentHashMap<String, SymbolEntry> entries = new ConcurrentHashMap<>();
 
     public KlineAggregator(KlineProperties properties) {
         this.properties = properties;
@@ -203,18 +211,35 @@ public class KlineAggregator {
             }
         }
         this.periodSizes = periods.keySet().stream().mapToLong(Long::longValue).toArray();
-        for (long size : periodSizes) {
-            if (size <= 0) {
-                throw new IllegalArgumentException("window size must be positive, got " + size);
-            }
-        }
+        this.baseWindowSizeMs = periodSizes[0];
+        validatePeriodConfig();
         if (properties.getMaxWindowsPerSymbol() <= 0) {
             throw new IllegalArgumentException(
                     "maxWindowsPerSymbol must be positive, got " + properties.getMaxWindowsPerSymbol());
         }
     }
 
-    /** 已配置的全部聚合周期（毫秒），升序。 */
+    /**
+     * 周期组合校验：每个周期必须为正，且必须是最小（基础）周期的整数倍。
+     * 不满足整数倍时窗口边界永远无法对齐（如 60s + 90s），大周期成交量/笔数
+     * 不可能与覆盖的小周期对上，因此在启动时以可区分原因拒绝，服务不带病运行。
+     */
+    private void validatePeriodConfig() {
+        for (long size : periodSizes) {
+            if (size <= 0) {
+                throw new TickRejectedException(RejectReason.INVALID_PERIOD_CONFIG,
+                        "window size must be positive, got " + size);
+            }
+            if (size % baseWindowSizeMs != 0) {
+                throw new TickRejectedException(RejectReason.INVALID_PERIOD_CONFIG,
+                        "configured window size " + size + "ms is not an integer multiple of base window size "
+                                + baseWindowSizeMs + "ms; window boundaries would never align and multi-period "
+                                + "aggregates could not be reconciled");
+            }
+        }
+    }
+
+    /** 已配置的全部聚合周期（毫秒），升序；首个为最小（基础）周期。 */
     public long[] configuredPeriods() {
         return periodSizes.clone();
     }
@@ -224,61 +249,64 @@ public class KlineAggregator {
         return windowStartOf(timestamp, defaultWindowSizeMs);
     }
 
-    private WindowStore requireStore(String symbol, long periodMs) {
-        ConcurrentHashMap<Long, WindowStore> stores = storesBySymbol.get(symbol);
-        if (stores == null) {
-            return null;
-        }
-        WindowStore store = stores.get(periodMs);
+    /** 惰性为某标的创建全部周期的窗口表与去重表。 */
+    private SymbolEntry entryFor(String symbol) {
+        return entries.computeIfAbsent(symbol, s -> new SymbolEntry());
+    }
+
+    /** 取已配置周期的窗口表，未配置周期抛可区分异常。调用时须持有 entry 锁。 */
+    private WindowStore requireStore(SymbolEntry entry, long periodMs) {
+        WindowStore store = entry.stores.get(periodMs);
         if (store == null) {
             throw new TickRejectedException(RejectReason.UNSUPPORTED_WINDOW_SIZE,
-                    "window size " + periodMs + "ms is not configured for symbol " + symbol);
+                    "window size " + periodMs + "ms is not configured; configured periods="
+                            + describePeriods());
         }
         return store;
     }
 
-    /** 惰性为某标的创建全部周期的窗口表。 */
-    private ConcurrentHashMap<Long, WindowStore> storesFor(String symbol) {
-        return storesBySymbol.computeIfAbsent(symbol, s -> {
-            ConcurrentHashMap<Long, WindowStore> created = new ConcurrentHashMap<>();
-            for (long size : periodSizes) {
-                created.put(size, new WindowStore(size, properties.getMaxWindowsPerSymbol()));
-            }
-            return created;
-        });
+    private String describePeriods() {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < periodSizes.length; i++) {
+            sb.append(i == 0 ? "" : ", ").append(periodSizes[i]);
+        }
+        return sb.append("]ms").toString();
     }
 
     /**
-     * 上报一笔成交（调用前须已通过校验）。
-     *
-     * <p>处理顺序（任一步失败都不会留下部分写入）：
+     * 上报一笔成交（调用前须已通过校验）。整段在该标的的 entry 锁内原子完成：
      * <ol>
+     *   <li>幂等判定 —— 重复 tickId 直接返回 DUPLICATE，先于回收判定，
+     *       已接受过的成交即使窗口已回收也永远是重复提交，不引起任何状态变更；</li>
      *   <li>对所有周期检查目标窗口是否已回收 —— 任一周期已回收则 WINDOW_EVICTED 拒绝；</li>
-     *   <li>幂等去重 —— 重复 tickId 返回 DUPLICATE；</li>
      *   <li>在每个周期各计入一次，再各自按上限回收。</li>
      * </ol>
      */
     public IngestResult ingest(TradeTick tick) {
-        ConcurrentHashMap<Long, WindowStore> stores = storesFor(tick.symbol());
+        SymbolEntry entry = entryFor(tick.symbol());
+        synchronized (entry) {
+            long defaultWindowStart = windowStartOf(tick.timestamp(), defaultWindowSizeMs);
 
-        // 阶段 1：回收检查先于一切状态变更，保证不会在部分周期写入
-        for (long size : periodSizes) {
-            stores.get(size).checkNotEvicted(windowStartOf(tick.timestamp(), size));
-        }
+            // 阶段 1：幂等判定先于一切（含回收检查）。去重表只记录“已接受”的成交，
+            // 不随回收删除：曾经接受过的成交即使窗口已回收也永远判 DUPLICATE
+            if (entry.seenTickIds.contains(tick.tickId())) {
+                return IngestResult.duplicate(tick, defaultWindowStart);
+            }
 
-        // 阶段 2：幂等（去重表不随回收删除）
-        Set<String> seen = seenTickIds.computeIfAbsent(tick.symbol(),
-                k -> ConcurrentHashMap.newKeySet());
-        long defaultWindowStart = windowStartOf(tick.timestamp(), defaultWindowSizeMs);
-        if (!seen.add(tick.tickId())) {
-            return IngestResult.duplicate(tick, defaultWindowStart);
-        }
+            // 阶段 2：全周期回收检查先于任何写入与去重登记，保证：
+            //  (a) 被拒绝的迟到成交不会留下部分周期写入；
+            //  (b) 从未被接受的成交不会占用去重表，重复提交仍是 WINDOW_EVICTED（结论可复现）
+            for (long size : periodSizes) {
+                entry.stores.get(size).checkNotEvicted(windowStartOf(tick.timestamp(), size));
+            }
 
-        // 阶段 3：每个周期各计一次，随后各自回收最旧窗口
-        for (long size : periodSizes) {
-            stores.get(size).apply(tick);
+            // 阶段 3：登记幂等并在每个周期各计一次，随后各自回收最旧窗口
+            entry.seenTickIds.add(tick.tickId());
+            for (long size : periodSizes) {
+                entry.stores.get(size).apply(tick);
+            }
+            return IngestResult.accepted(tick, defaultWindowStart);
         }
-        return IngestResult.accepted(tick, defaultWindowStart);
     }
 
     /**
@@ -290,11 +318,34 @@ public class KlineAggregator {
 
     /**
      * 查询某标的某时刻所属窗口、指定周期的 K 线一致快照。
-     * 未配置周期抛 UNSUPPORTED_WINDOW_SIZE；窗口已回收或无成交返回 empty。
+     * 未配置周期抛 UNSUPPORTED_WINDOW_SIZE；大周期窗口虽有数据但覆盖的最小周期窗口
+     * 已回收、无法完整核对时抛 WINDOW_UNVERIFIABLE；窗口已回收或无成交返回 empty。
      */
     public Optional<Kline> klineAt(String symbol, long periodMs, long timestamp) {
-        WindowStore store = requireStore(symbol, periodMs);
-        return store == null ? Optional.empty() : store.klineAt(symbol, timestamp);
+        SymbolEntry entry = entries.get(symbol);
+        if (entry == null) {
+            return Optional.empty();
+        }
+        synchronized (entry) {
+            WindowStore store = requireStore(entry, periodMs);
+            long windowStart = windowStartOf(timestamp, periodMs);
+            KlineState state = store.stateAt(windowStart);
+            if (state == null) {
+                return Optional.empty();
+            }
+            if (periodMs != baseWindowSizeMs) {
+                long baseEvictedBefore = entry.stores.get(baseWindowSizeMs).evictedBefore();
+                if (windowStart < baseEvictedBefore) {
+                    throw new TickRejectedException(RejectReason.WINDOW_UNVERIFIABLE,
+                            "window starting at " + windowStart + " (period=" + periodMs
+                                    + "ms) still holds aggregate data, but some "
+                                    + "base-period (" + baseWindowSizeMs + "ms) windows it covers were "
+                                    + "evicted (baseEvictedBefore=" + baseEvictedBefore
+                                    + "); the aggregate cannot be reconciled and is unavailable");
+                }
+            }
+            return Optional.of(state.snapshot(symbol, windowStart, periodMs));
+        }
     }
 
     /**
@@ -306,17 +357,30 @@ public class KlineAggregator {
 
     /**
      * 查询某标的指定周期全部保留窗口的 K 线快照（按窗口起点升序）。
+     * 大周期中无法由仍然保留的最小周期窗口完整对上的旧窗口直接剔除——
+     * 本接口返回的每一个大周期窗口都保证能与现存小周期完整对上。
      */
     public List<Kline> klines(String symbol, long periodMs) {
-        WindowStore store = requireStore(symbol, periodMs);
-        return store == null ? List.of() : store.all(symbol);
+        SymbolEntry entry = entries.get(symbol);
+        if (entry == null) {
+            return List.of();
+        }
+        synchronized (entry) {
+            WindowStore store = requireStore(entry, periodMs);
+            long notBefore = periodMs == baseWindowSizeMs
+                    ? Long.MIN_VALUE
+                    : entry.stores.get(baseWindowSizeMs).evictedBefore();
+            return store.all(symbol, notBefore);
+        }
     }
 
     /**
      * 按时间范围查询某标的指定周期的连续窗口槽位（窗口起点落在 [from, to)）。
      *
-     * <p>整批结果在同一 store 锁内生成，来自同一时刻的一致视图。每个槽位带状态：
-     * FILLED（有成交）、EMPTY（保留范围内无成交）、UNAVAILABLE（已回收或系统无此段数据）。
+     * <p>整批结果在该标的的 entry 锁内生成，来自同一时刻的一致视图。每个槽位带状态：
+     * FILLED（有成交且可由保留小周期对上）、EMPTY（保留范围内无成交）、
+     * UNAVAILABLE（该周期自身窗口已回收，或系统无此标的）、
+     * UNVERIFIABLE（大周期自身有数据但覆盖的最小周期窗口已回收，数据不可信）。
      * 起止颠倒或跨度超过 kline.max-range-windows 时以 INVALID_RANGE 拒绝；
      * 未配置周期以 UNSUPPORTED_WINDOW_SIZE 拒绝。
      */
@@ -335,18 +399,48 @@ public class KlineAggregator {
                     "range covers " + slotCount + " windows of " + periodMs + "ms, exceeds limit "
                             + properties.getMaxRangeWindows());
         }
-        WindowStore store = requireStore(symbol, periodMs);
-        if (store == null) {
+        SymbolEntry entry = entries.get(symbol);
+        if (entry == null) {
             // 该标的从未出现：系统中根本没有这段数据，逐槽位明确标注 UNAVAILABLE
-            List<KlineRangeEntry> entries = new ArrayList<>((int) slotCount);
+            return unavailableSlots(periodMs, from, to, slotCount);
+        }
+        synchronized (entry) {
+            WindowStore store = requireStore(entry, periodMs);
+            long baseEvictedBefore = periodMs == baseWindowSizeMs
+                    ? Long.MIN_VALUE
+                    : entry.stores.get(baseWindowSizeMs).evictedBefore();
             long firstIndex = ceilDiv(from, periodMs);
             long endIndex = ceilDiv(to, periodMs);
+            List<KlineRangeEntry> entries = new ArrayList<>((int) Math.max(0, endIndex - firstIndex));
             for (long i = firstIndex; i < endIndex; i++) {
                 long start = Math.multiplyExact(i, periodMs);
-                entries.add(KlineRangeEntry.unavailable(start, Math.addExact(start, periodMs)));
+                long end = Math.addExact(start, periodMs);
+                KlineState state = store.stateAt(start);
+                if (state != null) {
+                    if (start < baseEvictedBefore) {
+                        // 大周期有值但覆盖的小周期已回收：不可信，按不可用显式标注
+                        entries.add(KlineRangeEntry.unverifiable(start, end));
+                    } else {
+                        entries.add(KlineRangeEntry.filled(state.snapshot(symbol, start, periodMs)));
+                    }
+                } else if (start < store.evictedBefore()) {
+                    entries.add(KlineRangeEntry.unavailable(start, end));
+                } else {
+                    entries.add(KlineRangeEntry.empty(start, end));
+                }
             }
             return entries;
         }
-        return store.range(symbol, from, to);
+    }
+
+    private static List<KlineRangeEntry> unavailableSlots(long periodMs, long from, long to, long slotCount) {
+        List<KlineRangeEntry> entries = new ArrayList<>((int) slotCount);
+        long firstIndex = ceilDiv(from, periodMs);
+        long endIndex = ceilDiv(to, periodMs);
+        for (long i = firstIndex; i < endIndex; i++) {
+            long start = Math.multiplyExact(i, periodMs);
+            entries.add(KlineRangeEntry.unavailable(start, Math.addExact(start, periodMs)));
+        }
+        return entries;
     }
 }

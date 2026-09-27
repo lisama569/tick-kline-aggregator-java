@@ -29,15 +29,18 @@ public class MarketDataController {
         this.klineService = klineService;
     }
 
-    /** 上报一笔逐笔成交。非法输入返回 400 + 可区分拒绝原因；重复提交返回 200 + DUPLICATE；
-     *  目标窗口已回收返回 400 + WINDOW_EVICTED。 */
+    /** 上报一笔逐笔成交。非法输入返回 400 + 可区分拒绝原因；
+     *  曾接受过的成交重复上报（含其窗口已回收的情况）稳定返回 200 + DUPLICATE；
+     *  从未接受的成交落入已回收窗口返回 400 + WINDOW_EVICTED。 */
     @PostMapping("/ticks")
     public IngestResult reportTick(@RequestBody TradeTick tick) {
         return klineService.report(tick);
     }
 
     /** 查询某时刻所属窗口的 K 线一致快照；窗口无数据返回 404。
-     *  可选 periodMs 指定聚合周期（须为已配置周期），缺省为默认周期。 */
+     *  可选 periodMs 指定聚合周期（须为已配置周期），缺省为默认周期。
+     *  大周期窗口虽有数据但覆盖的基础周期窗口已回收、无法核对时，
+     *  返回 400 + WINDOW_UNVERIFIABLE，明确告知该大周期数据不可用而非正常结果。 */
     @GetMapping("/klines/{symbol}/at/{timestamp}")
     public ResponseEntity<Kline> klineAt(@PathVariable String symbol,
                                          @PathVariable long timestamp,
@@ -59,8 +62,9 @@ public class MarketDataController {
     }
 
     /** 按时间范围查询连续窗口槽位（窗口起点落在 [from, to)）。
-     *  整批来自同一时刻的一致视图；每个槽位带状态 FILLED / EMPTY / UNAVAILABLE，
-     *  可区分“窗口无成交”与“系统中已无该段数据”。periodMs 缺省为默认周期。 */
+     *  整批来自同一时刻的一致视图；每个槽位带状态 FILLED / EMPTY / UNAVAILABLE / UNVERIFIABLE，
+     *  可区分“窗口无成交”“数据已回收”与“大周期仍有值但覆盖小周期已回收、对不上”。
+     *  periodMs 缺省为默认周期。 */
     @GetMapping("/klines/{symbol}/range")
     public List<KlineRangeEntry> klinesRange(@PathVariable String symbol,
                                              @RequestParam long from,
